@@ -140,7 +140,7 @@ npm run start:market
 시장조회 모드의 시세 4종과 신규 API 4종은 `metadata`와 `raw`를 반환합니다. 신규 API는 기본 실행에서도 같은 형식입니다. `raw`에는 KIS 응답 필드와 문자열 값을 그대로 보존합니다.
 
 - `metadata.status`: `ok`(필수 필드 확인), `empty`(자료 행 없음), `partial`(누락 필드·요청일 자료 누락·범위 밖 자료·연속조회 잔여), `error`(인증·HTTP·KIS·입력 오류). 오류는 MCP `isError=true`로도 표시합니다. 빈 응답을 휴장이나 순매수 0으로 해석하지 마세요.
-- `request_params`와 `requested_dates`: 실제 요청 인수·날짜. `response_dates`: 데이터 행의 `stck_bsop_date` 또는 `xymd`에서 확인한 날짜. `requested_date_present=false`이면 이전 거래일 자료를 요청일 자료로 대신 쓰지 마세요.
+- `request_params`와 `requested_dates`: 실제 요청 인수·날짜. `response_dates`: 데이터 행의 `stck_bsop_date` 또는 `xymd`에서 확인한 날짜. `requested_date_present`는 수급 지정일·프로그램 단일일자 조회에서 검사하며, `false`이면 이전 거래일 자료를 요청일 자료로 대신 쓰지 마세요. 차트 날짜는 조회 범위의 경계이므로 이 값은 `null`이며 시작일에 봉이 없어도 정상 응답일 수 있습니다.
 - `fetched_at`: HTTP 응답 처리 완료 시각(UTC ISO 형식), 응답 수신 전 실패 시 `null`. `data_as_of`: 확인 가능한 응답 기준시각이 없어 `null`. 조회 시각이나 HTTP Date를 데이터 기준시각으로 사용하지 않습니다.
 - `units`: 금액·수량 단위는 확인 전까지 `null`, `conversion_applied=false`. 원문 숫자를 원·천주·억 원 등으로 임의 환산하지 않습니다.
 - `source`: KIS 호스트·경로·TR ID. `market_scope`: 요청한 시장·거래소 범위. `continuation`: 응답의 `tr_cont`와 추가 자료 유무. 자동 연속조회는 수행하지 않습니다.

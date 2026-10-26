@@ -29,6 +29,7 @@ interface Endpoint {
   params: z.ZodTypeAny;
   outputs: string[];
   dateField?: string;
+  checkRequestedDate?: boolean;
   required: string[];
 }
 
@@ -75,7 +76,7 @@ const endpoints: Record<string, Endpoint> = {
     }).strict().refine((p) => p.FID_INPUT_DATE_1 === p.FID_INPUT_DATE_2 &&
       p.FID_INPUT_ISCD === p.FID_INPUT_ISCD_2 &&
       p.FID_INPUT_ISCD === (p.FID_INPUT_ISCD_1 === "KSP" ? "0001" : "1001"), "시장·날짜 인수가 일치해야 합니다."),
-    outputs: ["output"], dateField: "stck_bsop_date",
+    outputs: ["output"], dateField: "stck_bsop_date", checkRequestedDate: true,
     required: ["stck_bsop_date", "frgn_ntby_qty", "prsn_ntby_qty", "orgn_ntby_qty", "frgn_ntby_tr_pbmn", "prsn_ntby_tr_pbmn", "orgn_ntby_tr_pbmn"],
   },
   [quotationPath + "investor-trade-by-stock-daily"]: {
@@ -84,7 +85,7 @@ const endpoints: Record<string, Endpoint> = {
       FID_COND_MRKT_DIV_CODE: venueSchema, FID_INPUT_ISCD: stockSchema, FID_INPUT_DATE_1: dateSchema,
       FID_ORG_ADJ_PRC: z.literal(""), FID_ETC_CLS_CODE: z.literal(""),
     }).strict(),
-    outputs: ["output1", "output2"], dateField: "stck_bsop_date",
+    outputs: ["output1", "output2"], dateField: "stck_bsop_date", checkRequestedDate: true,
     required: ["stck_bsop_date", "frgn_ntby_qty", "prsn_ntby_qty", "orgn_ntby_qty", "frgn_ntby_tr_pbmn", "prsn_ntby_tr_pbmn", "orgn_ntby_tr_pbmn"],
   },
   [quotationPath + "comp-program-trade-daily"]: {
@@ -93,7 +94,7 @@ const endpoints: Record<string, Endpoint> = {
       FID_COND_MRKT_DIV_CODE: venueSchema, FID_MRKT_CLS_CODE: z.enum(["K", "Q"]),
       FID_INPUT_DATE_1: dateSchema, FID_INPUT_DATE_2: dateSchema,
     }).strict(),
-    outputs: ["output"], dateField: "stck_bsop_date",
+    outputs: ["output"], dateField: "stck_bsop_date", checkRequestedDate: true,
     required: ["stck_bsop_date", "arbt_smtn_ntby_tr_pbmn", "nabt_smtn_ntby_tr_pbmn"],
   },
 };
@@ -123,8 +124,8 @@ export function marketEnvelope(env: string, path: string, trId: string, params: 
   const primary = endpoint ? rows(raw?.[endpoint.outputs.at(-1)!]).filter((r) => Object.values(r).some(present)) : [];
   const dates = [...new Set(primary.map((r) => r[endpoint?.dateField ?? ""]).filter((v): v is string => typeof v === "string" && dateSchema.safeParse(v).success))].sort();
   const requestedDates = Object.fromEntries(Object.entries(params).filter(([k]) => k.startsWith("FID_INPUT_DATE_")));
-  // DATE_1 단독은 기준일, 동일 날짜 범위는 지정일입니다. 과거 행을 당일 자료로 간주하지 않습니다.
-  const requestedDate = params.FID_INPUT_DATE_1 && (!params.FID_INPUT_DATE_2 || params.FID_INPUT_DATE_1 === params.FID_INPUT_DATE_2) ? params.FID_INPUT_DATE_1 : null;
+  // 수급의 지정일과 프로그램 단일일자 조회만 검사합니다. 차트 시작일은 범위 경계입니다.
+  const requestedDate = endpoint?.checkRequestedDate && params.FID_INPUT_DATE_1 && (!params.FID_INPUT_DATE_2 || params.FID_INPUT_DATE_1 === params.FID_INPUT_DATE_2) ? params.FID_INPUT_DATE_1 : null;
   const datePresent = requestedDate && endpoint?.dateField ? dates.includes(requestedDate) : null;
   const continuation = trCont === "M" || trCont === "F";
   const missingOutput = !!endpoint && endpoint.outputs.some((key) => {

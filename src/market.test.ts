@@ -183,6 +183,36 @@ test("재사용 시세 도구 4개도 시장 모드에서는 원응답과 메타
   }
 });
 
+for (const [period, barDate] of [["D", "20261019"], ["W", "20261023"], ["M", "20261030"]] as const) {
+  test(`차트 시작일만 지정한 ${period}봉은 시작일의 봉이 없어도 정상 응답이다`, async () => {
+    payload = { rt_cd: "0", output1: { stck_prpr: "70000" }, output2: [{ stck_bsop_date: barDate, stck_clpr: "70000" }] };
+    const { response, envelope } = await call("kis_get_domestic_stock_chart", {
+      stock_code: "005930", period, start_date: "20261018",
+    });
+    assert.equal(response.isError, false);
+    assert.equal(envelope.metadata.status, "ok");
+    assert.equal(envelope.metadata.requested_date_present, null);
+    assert.deepEqual(envelope.metadata.requested_dates, { FID_INPUT_DATE_1: "20261018", FID_INPUT_DATE_2: "" });
+    assert.deepEqual(envelope.metadata.response_dates, [barDate]);
+    assert.deepEqual(envelope.metadata.warnings, []);
+    assert.deepEqual(envelope.raw, payload);
+  });
+}
+
+test("시장·종목 수급의 지정일 자료가 없으면 계속 부분 응답으로 표시한다", async () => {
+  const previousRow = { ...investorRow, stck_bsop_date: "20261022" };
+  for (const fixture of [
+    { name: "kis_get_market_investor_daily", args: { date: "20261023" }, raw: { rt_cd: "0", output: [previousRow] } },
+    { name: "kis_get_stock_investor_daily", args: { stock_code: "005930", date: "20261023" }, raw: { rt_cd: "0", output1: { stck_prpr: "70000" }, output2: [previousRow] } },
+  ]) {
+    payload = fixture.raw;
+    const { envelope } = await call(fixture.name, fixture.args);
+    assert.equal(envelope.metadata.status, "partial", fixture.name);
+    assert.equal(envelope.metadata.requested_date_present, false);
+    assert.ok(envelope.metadata.warnings.some((warning: string) => warning.includes("요청한 날짜의 자료가 응답에 없습니다")));
+  }
+});
+
 test("오류·빈 응답·부분 응답·요청일 누락을 구분하고 0을 결측으로 취급하지 않는다", async () => {
   const path = prefix + "inquire-investor-daily-by-market";
   const envelope = (raw: Record<string, unknown>, trCont = "") => marketEnvelope("real", path, "FHPTJ04040000", investorParams, raw, trCont);
