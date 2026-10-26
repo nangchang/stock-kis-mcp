@@ -7,8 +7,11 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "node --import tsx/esm --test 'src/master.test.ts' 'src/index.test.ts'",
-    "test:integration": "node --import tsx/esm --test 'src/integration.test.ts'"
+    "start:market": "node dist/market-only.js",
+    "dev:market": "tsx src/market-only.ts",
+    "test": "node --import tsx/esm --test 'src/master.test.ts' 'src/index.test.ts' 'src/market.test.ts'",
+    "test:integration": "node --import tsx/esm --test 'src/integration.test.ts'",
+    "test:market:integration": "node --import tsx/esm --test 'src/market.integration.test.ts'"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

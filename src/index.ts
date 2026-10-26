@@ -13,6 +13,7 @@ import { z } from "zod";
 import { fetch } from "undici";
 import { fileURLToPath } from "node:url";
 import * as master from "./master.js";
+import { assertMarketRequest, marketEnvelope, marketFailure, marketResult, MarketRequestError, rememberMarketResponse, registerMarketTools } from "./market.js";
 
 const REAL_URL = "https://openapi.koreainvestment.com:9443";
 const PAPER_URL = "https://openapivts.koreainvestment.com:29443";
@@ -47,13 +48,15 @@ function baseUrl(env: string): string {
   return env === "real" ? REAL_URL : PAPER_URL;
 }
 
-export async function getAccessToken(env: string): Promise<string> {
+export async function getAccessToken(env: string, marketOnly = false): Promise<string> {
+  if (marketOnly && env !== "real") throw new Error("시장조회 모드는 env='real'만 허용합니다.");
   const cached = tokenCache[env];
   if (cached && cached.expiresAt - Date.now() / 1000 > 300) return cached.token;
 
   const { appKey, appSecret } = getCredentials(env);
   const resp = await fetch(`${baseUrl(env)}/oauth2/tokenP`, {
     method: "POST",
+    ...(marketOnly ? { redirect: "error" as const, signal: AbortSignal.timeout(15_000) } : {}),
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ grant_type: "client_credentials", appkey: appKey, appsecret: appSecret }),
   });
@@ -63,6 +66,9 @@ export async function getAccessToken(env: string): Promise<string> {
     access_token: string;
     access_token_token_expired: string;
   };
+  if (marketOnly && (typeof data.access_token !== "string" || !data.access_token)) {
+    throw new Error("토큰 응답에 access_token이 없습니다.");
+  }
 
   let expiresAt: number;
   try {
@@ -74,9 +80,9 @@ export async function getAccessToken(env: string): Promise<string> {
   return data.access_token;
 }
 
-async function buildHeaders(env: string, trId: string, trCont = ""): Promise<Record<string, string>> {
+async function buildHeaders(env: string, trId: string, trCont = "", marketOnly = false): Promise<Record<string, string>> {
   const { appKey, appSecret } = getCredentials(env);
-  const token = await getAccessToken(env);
+  const token = await getAccessToken(env, marketOnly);
   return {
     "Content-Type": "application/json",
     Accept: "text/plain",
@@ -92,26 +98,48 @@ async function buildHeaders(env: string, trId: string, trCont = ""): Promise<Rec
 
 type ApiData = Record<string, unknown>;
 
-export async function apiGet(
+async function requestGet(
+  marketOnly: boolean,
   env: string,
   apiPath: string,
   trId: string,
   params: Record<string, string>,
   trCont = "",
 ): Promise<ApiData> {
-  const headers = await buildHeaders(env, trId, trCont);
-  const url = new URL(`${baseUrl(env)}${apiPath}`);
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  // 검증한 인수가 인증 대기 중 변경되지 않도록 요청 단위로 복사합니다.
+  params = { ...params };
+  try {
+    if (marketOnly) assertMarketRequest(env, "GET", apiPath, trId, params, trCont);
+    const headers = await buildHeaders(env, trId, trCont, marketOnly);
+    const url = new URL(`${baseUrl(env)}${apiPath}`);
+    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
 
-  const resp = await fetch(url.toString(), { headers });
-  if (!resp.ok) {
-    const body = await resp.text();
-    throw Object.assign(new Error(`HTTP ${resp.status}`), { body });
+    const resp = await fetch(url.toString(), {
+      method: "GET", headers,
+      ...(marketOnly ? { redirect: "error" as const, signal: AbortSignal.timeout(15_000) } : {}),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw Object.assign(new Error(`HTTP ${resp.status}`), { body, status: resp.status });
+    }
+    const data = (await resp.json()) as ApiData;
+    // tr_cont는 HTTP 응답 헤더에 있음
+    data["_tr_cont"] = resp.headers.get("tr_cont") ?? "";
+    if (marketOnly) rememberMarketResponse(data, env, apiPath, trId, params, data["_tr_cont"] as string, resp.status);
+    return data;
+  } catch (error) {
+    if (!marketOnly) throw error;
+    let raw: ApiData | null = null;
+    const body = (error as { body?: string }).body;
+    if (body) {
+      try { raw = JSON.parse(body) as ApiData; } catch { raw = { body }; }
+    }
+    throw new MarketRequestError(marketEnvelope(env, apiPath, trId, params, raw, "", (error as Error).message, (error as { status?: number }).status ?? null));
   }
-  const data = (await resp.json()) as ApiData;
-  // tr_cont는 HTTP 응답 헤더에 있음
-  data["_tr_cont"] = resp.headers.get("tr_cont") ?? "";
-  return data;
+}
+
+export function apiGet(env: string, apiPath: string, trId: string, params: Record<string, string>, trCont = ""): Promise<ApiData> {
+  return requestGet(false, env, apiPath, trId, params, trCont);
 }
 
 async function apiPost(env: string, apiPath: string, trId: string, body: Record<string, string>): Promise<ApiData> {
@@ -126,6 +154,17 @@ async function apiPost(env: string, apiPath: string, trId: string, body: Record<
     throw Object.assign(new Error(`HTTP ${resp.status}`), { body: text });
   }
   return resp.json() as Promise<ApiData>;
+}
+
+export function createApiClient(mode: "full" | "market" = "full") {
+  return {
+    apiGet: (env: string, path: string, trId: string, params: Record<string, string>, trCont = "") => requestGet(mode === "market", env, path, trId, params, trCont),
+    apiPost: async (env: string, path: string, trId: string, body: Record<string, string>) => {
+      // 토큰 POST는 getAccessToken의 고정 경로·본문에서만 실행합니다.
+      if (mode === "market") throw new Error("시장조회 모드에서는 API POST를 허용하지 않습니다.");
+      return apiPost(env, path, trId, body);
+    },
+  };
 }
 
 export function checkResponse(data: ApiData, ctx: string): string {
@@ -149,7 +188,11 @@ function text(result: string) {
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "kis_mcp", version: "0.1.0" });
+export function createServer(mode: "full" | "market" = "full"): McpServer {
+const marketOnly = mode === "market";
+const server = new McpServer({ name: marketOnly ? "kis_market_mcp" : "kis_mcp", version: "0.1.0" });
+const { apiGet, apiPost } = createApiClient(mode);
+const quoteEnv = marketOnly ? z.literal("real").default("real") : z.string().default("real");
 
 // ─── Tool 1: 국내주식 현재가 ──────────────────────────────────────────────────
 
@@ -159,7 +202,7 @@ server.tool(
   {
     stock_code: z.string().describe("종목코드 6자리 (예: '005930' 삼성전자)"),
     market: z.string().default("J").describe("시장코드: J(KRX, 기본값), NX(NXT), UN(통합)"),
-    env: z.string().default("real").describe("'real'(실전) 또는 'demo'(모의)"),
+    env: quoteEnv.describe("'real'(실전) 또는 'demo'(모의). 시장조회 모드는 real만 허용"),
   },
   async ({ stock_code, market, env }) => {
     try {
@@ -167,6 +210,7 @@ server.tool(
         FID_COND_MRKT_DIV_CODE: market,
         FID_INPUT_ISCD: stock_code,
       });
+      if (marketOnly) return marketResult(data);
       const err = checkResponse(data, "국내주식 현재가");
       if (err) return text(err);
       const o = getOutput(data, "output");
@@ -187,6 +231,7 @@ server.tool(
         PBR: o["pbr"],
       }));
     } catch (e: unknown) {
+      if (marketOnly) return marketFailure(e);
       return text(`Error: ${(e as Error).message}`);
     }
   },
@@ -204,7 +249,7 @@ server.tool(
     end_date: z.string().default("").describe("종료일 YYYYMMDD (예: '20241231', 미입력 시 오늘)"),
     adjusted: z.string().default("1").describe("수정주가: '1'(반영, 기본값), '0'(미반영)"),
     market: z.string().default("J").describe("시장코드: J(KRX, 기본값), NX, UN"),
-    env: z.string().default("real").describe("'real' 또는 'demo'"),
+    env: quoteEnv.describe("'real' 또는 'demo'. 시장조회 모드는 real만 허용"),
   },
   async ({ stock_code, period, start_date, end_date, adjusted, market, env }) => {
     try {
@@ -221,6 +266,7 @@ server.tool(
           FID_ORG_ADJ_PRC: adjusted,
         },
       );
+      if (marketOnly) return marketResult(data);
       const err = checkResponse(data, "국내주식 기간별시세");
       if (err) return text(err);
       const rows = (data["output2"] as ApiData[]) ?? [];
@@ -235,6 +281,7 @@ server.tool(
       }));
       return text(fmt({ 종목코드: stock_code, 기간: period, 데이터: result }));
     } catch (e: unknown) {
+      if (marketOnly) return marketFailure(e);
       return text(`Error: ${(e as Error).message}`);
     }
   },
@@ -242,6 +289,7 @@ server.tool(
 
 // ─── Tool 3: 국내주식 잔고 ────────────────────────────────────────────────────
 
+if (!marketOnly) {
 server.tool(
   "kis_get_domestic_balance",
   "국내주식 계좌의 보유 종목 잔고를 조회합니다. 수량·매입단가·평가금액·수익률 등을 반환합니다.",
@@ -470,6 +518,8 @@ server.tool(
   },
 );
 
+}
+
 // ─── Tool 7: 해외주식 현재가 ──────────────────────────────────────────────────
 
 server.tool(
@@ -479,8 +529,8 @@ server.tool(
     symbol: z.string().describe("종목코드 (예: 'AAPL', 'TSLA')"),
     exchange: z
       .string()
-      .describe("거래소코드: NAS(나스닥), NYSE(뉴욕), AMEX, SEHK(홍콩), SHAA(중국상해), SZAA(중국심천), TKSE(일본), HASE(베트남하노이), VNSE(베트남호치민)"),
-    env: z.string().default("real").describe("'real' 또는 'demo'"),
+      .describe("시세 거래소코드: NAS, NYS, AMS, HKS, SHS, SZS, TSE, HNX, HSX"),
+    env: quoteEnv.describe("'real' 또는 'demo'. 시장조회 모드는 real만 허용"),
   },
   async ({ symbol, exchange, env }) => {
     try {
@@ -489,6 +539,7 @@ server.tool(
         EXCD: exchange,
         SYMB: symbol,
       });
+      if (marketOnly) return marketResult(data);
       const err = checkResponse(data, "해외주식 현재가");
       if (err) return text(err);
       const o = getOutput(data, "output");
@@ -505,6 +556,7 @@ server.tool(
         매수가능여부: o["ordy"],
       }));
     } catch (e: unknown) {
+      if (marketOnly) return marketFailure(e);
       return text(`Error: ${(e as Error).message}`);
     }
   },
@@ -517,9 +569,9 @@ server.tool(
   "해외주식 일/주/월별 OHLCV 데이터를 조회합니다.",
   {
     symbol: z.string().describe("종목코드 (예: 'AAPL')"),
-    exchange: z.string().describe("거래소코드 (NAS/NYSE/AMEX/SEHK 등)"),
+    exchange: z.string().describe("시세 거래소코드: NAS, NYS, AMS, HKS, SHS, SZS, TSE, HNX, HSX"),
     period: z.string().default("0").describe("기간: '0'(일봉, 기본값), '1'(주봉), '2'(월봉)"),
-    env: z.string().default("real").describe("'real' 또는 'demo'"),
+    env: quoteEnv.describe("'real' 또는 'demo'. 시장조회 모드는 real만 허용"),
   },
   async ({ symbol, exchange, period, env }) => {
     try {
@@ -531,6 +583,7 @@ server.tool(
         BYMD: "",
         MODP: "0",
       });
+      if (marketOnly) return marketResult(data);
       const err = checkResponse(data, "해외주식 일별시세");
       if (err) return text(err);
       const rows = (data["output2"] as ApiData[]) ?? [];
@@ -544,6 +597,7 @@ server.tool(
       }));
       return text(fmt({ 종목코드: symbol, 거래소: exchange, 기간: period, 데이터: result }));
     } catch (e: unknown) {
+      if (marketOnly) return marketFailure(e);
       return text(`Error: ${(e as Error).message}`);
     }
   },
@@ -551,6 +605,7 @@ server.tool(
 
 // ─── Tool 9: 해외주식 잔고 ────────────────────────────────────────────────────
 
+if (!marketOnly) {
 server.tool(
   "kis_get_overseas_balance",
   "해외주식 계좌의 보유 종목 잔고를 조회합니다.",
@@ -704,6 +759,8 @@ server.tool(
   },
 );
 
+}
+
 // ─── Tool 11: 종목 검색 ───────────────────────────────────────────────────────
 
 server.tool(
@@ -726,6 +783,7 @@ server.tool(
     const results = master.search(query, targetMarkets, limit);
 
     const response: Record<string, unknown> = { 검색어: query, 결과수: results.length, 결과: results };
+    response["마스터_갱신상태"] = refreshStatus;
     if (staleFailed.length) {
       response["경고"] = `다음 시장 데이터 갱신 실패 (검색 결과 제한될 수 있음): ${staleFailed}`;
     }
@@ -745,9 +803,13 @@ server.tool(
   },
 );
 
+registerMarketTools(server, createApiClient("market").apiGet);
+return server;
+}
+
 // ─── 진입점 ───────────────────────────────────────────────────────────────────
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createServer().connect(transport);
 }

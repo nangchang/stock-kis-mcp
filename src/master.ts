@@ -8,7 +8,7 @@ import * as os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import AdmZip from "adm-zip";
 import iconv from "iconv-lite";
-import { fetch, Agent } from "undici";
+import { fetch } from "undici";
 
 export const DB_PATH = path.join(os.homedir(), ".kis_mcp", "master.db");
 
@@ -68,11 +68,8 @@ function isStale(market: string): boolean {
   }
 }
 
-// 마스터 파일 서버는 자체 서명 인증서 사용 → SSL 검증 비활성화
-const _agent = new Agent({ connect: { rejectUnauthorized: false } });
-
 async function downloadZip(url: string): Promise<Buffer> {
-  const resp = await fetch(url, { dispatcher: _agent });
+  const resp = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(15_000) });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${url}`);
   const buf = Buffer.from(await resp.arrayBuffer());
   const zip = new AdmZip(buf);
@@ -144,7 +141,14 @@ export async function ensureFresh(markets: string[]): Promise<Record<string, str
       try {
         result[m] = `갱신 (${await refresh(m)}종목)`;
       } catch (e) {
-        result[m] = `실패: ${e}`;
+        let cacheStatus = "확인 불가";
+        try {
+          const cached = getDbStats()[m];
+          cacheStatus = cached?.count ? `${cached.count}종목, 갱신일 ${cached.updated}` : "없음";
+        } catch {
+          // 캐시 자체가 읽히지 않아도 시장별 갱신 실패 상태는 반환합니다.
+        }
+        result[m] = `실패: ${e}; 기존 캐시: ${cacheStatus}`;
       }
     } else {
       result[m] = "최신";
