@@ -1,11 +1,18 @@
-import { test, describe, before, after } from "node:test";
+import { test, describe, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import iconv from "iconv-lite";
-import { parseDomestic, parseOverseas, search, getDbStats, ALL_MARKETS } from "./master.js";
+import * as https from "node:https";
+import { once } from "node:events";
+import AdmZip from "adm-zip";
+import { Agent, buildConnector, getGlobalDispatcher, setGlobalDispatcher } from "undici";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createServer } from "./index.js";
+import { parseDomestic, parseOverseas, search, getDbStats, ALL_MARKETS, refresh, ensureFresh } from "./master.js";
 
 // ─── 임시 DB 셋업 ─────────────────────────────────────────────────────────────
 
@@ -238,5 +245,111 @@ describe("getDbStats", () => {
     const stats = getDbStats();
     assert.equal(stats["TSE"].count, 0);
     assert.equal(stats["TSE"].updated, "없음");
+  });
+});
+
+describe("마스터 TLS 검증과 기존 캐시 보존", () => {
+  // 로컬 테스트 서버 전용 인증서/키입니다. 운영 신뢰 저장소와 무관합니다.
+  const cert = fs.readFileSync(new URL("./fixtures/localhost-cert.pem", import.meta.url));
+  const key = fs.readFileSync(new URL("./fixtures/localhost-key.pem", import.meta.url));
+  const previousDispatcher = getGlobalDispatcher();
+  const incoming: string[] = [];
+  let agent: Agent | undefined;
+  let port: number;
+  function zip(raw: Buffer): Buffer {
+    const archive = new AdmZip();
+    archive.addFile("master.mst", raw);
+    return archive.toBuffer();
+  }
+  const domesticZip = zip(iconv.encode("005930   " + "KR7005930003" + "삼성전자" + "X".repeat(228), "cp949"));
+  const overseasZip = zip(iconv.encode("a\tb\tc\td\tAAPL\tf\t애플", "cp949"));
+  const tlsServer = https.createServer({ cert, key }, (req, res) => {
+    incoming.push(req.url!);
+    res.end(req.url!.includes("kospi") ? domesticZip : overseasZip);
+  });
+
+  before(async () => {
+    tlsServer.listen(0, "127.0.0.1");
+    await once(tlsServer, "listening");
+    port = (tlsServer.address() as { port: number }).port;
+  });
+  afterEach(async () => {
+    setGlobalDispatcher(previousDispatcher);
+    await agent?.close();
+    agent = undefined;
+  });
+  after(async () => {
+    tlsServer.closeAllConnections();
+    await new Promise<void>((resolve, reject) => tlsServer.close((error) => error ? reject(error) : resolve()));
+  });
+  function routeToLocal(trustCert = false, servername = "localhost") {
+    const connect = buildConnector(trustCert ? { ca: cert } : {});
+    agent = new Agent({ connect: (options, callback) => connect({ ...options, hostname: "127.0.0.1", port: String(port), servername }, callback) });
+    setGlobalDispatcher(agent);
+  }
+
+  test("미신뢰 인증서와 호스트 불일치를 거절하며 캐시와 갱신일을 보존한다", async () => {
+    seedDb([["OLD", "기존종목", "KOSPI", null]], { KOSPI: "2020-01-01" });
+    const count = incoming.length;
+    routeToLocal();
+    await assert.rejects(refresh("KOSPI"), (error: { cause?: { code?: string } }) => error.cause?.code === "DEPTH_ZERO_SELF_SIGNED_CERT");
+    const statuses = await ensureFresh(["KOSPI"]);
+    assert.match(statuses.KOSPI, /^실패/);
+    assert.match(statuses.KOSPI, /갱신일 2020-01-01/);
+    assert.equal(search("OLD")[0].name, "기존종목");
+    assert.equal(getDbStats().KOSPI.updated, "2020-01-01");
+    await agent!.close();
+    routeToLocal(true, "wrong.example");
+    await assert.rejects(refresh("KOSPI"), (error: { cause?: { code?: string } }) => error.cause?.code === "ERR_TLS_CERT_ALTNAME_INVALID");
+    assert.equal(incoming.length, count, "TLS 검증 실패 시 HTTP 자료를 받지 않아야 함");
+    assert.equal(search("OLD").length, 1);
+  });
+
+  test("신뢰한 인증서로 국내·해외 마스터 다운로드와 정상 갱신이 유지된다", async () => {
+    seedDb([]);
+    routeToLocal(true);
+    assert.equal(await refresh("KOSPI"), 1);
+    assert.equal(await refresh("NAS"), 1);
+    assert.equal(search("삼성전자")[0].code, "005930");
+    assert.equal(search("애플")[0].code, "AAPL");
+    const stats = getDbStats();
+    assert.equal(stats.KOSPI.updated, new Date().toISOString().slice(0, 10));
+    const count = incoming.length;
+    assert.equal((await ensureFresh(["KOSPI"])).KOSPI, "최신");
+    assert.equal(incoming.length, count, "최신 캐시는 재다운로드하지 않음");
+  });
+
+  test("MCP 검색은 실패한 갱신일과 기존 결과를 함께 제공하며 빈 캐시도 명시한다", async () => {
+    seedDb([["005930", "삼성전자", "KOSPI", null]], { KOSPI: "2020-01-01" });
+    routeToLocal();
+    const server = createServer("market");
+    const client = new Client({ name: "cache-tests", version: "1" });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await server.connect(b);
+    await client.connect(a);
+    try {
+      const response = await client.callTool({ name: "kis_search_stock", arguments: { query: "삼성전자", markets: ["KOSPI", "NAS"] } });
+      const data = JSON.parse((response.content as { text: string }[])[0].text);
+      assert.equal(data.결과[0].code, "005930");
+      assert.match(data.마스터_갱신상태.KOSPI, /갱신일 2020-01-01/);
+      assert.match(data.마스터_갱신상태.NAS, /기존 캐시: 없음/);
+      assert.ok(data.경고.includes("KOSPI"));
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  test("캐시 상태를 읽을 수 없어도 시장별 실패 상태를 반환한다", async () => {
+    seedDb([]);
+    routeToLocal();
+    process.env.KIS_MCP_DB_PATH = path.join(testDbPath, "unusable.db");
+    try {
+      const statuses = await ensureFresh(["KOSPI", "NAS"]);
+      assert.match(statuses.KOSPI, /^실패:.*기존 캐시: 확인 불가$/);
+      assert.match(statuses.NAS, /^실패:.*기존 캐시: 확인 불가$/);
+    } finally {
+      process.env.KIS_MCP_DB_PATH = testDbPath;
+    }
   });
 });
